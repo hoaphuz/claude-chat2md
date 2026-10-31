@@ -1,0 +1,11 @@
+build/
+dist/
+*.exe
+logs/
+*.log
+# Nhật ký khi chạy `go run .`
+dev/
+# Ghi chú làm việc nội bộ, không đưa lên kho mã
+tasks/
+# Gói icon gốc, nội dung đã nằm trong assets/icons/
+chat2md-icons.zip
