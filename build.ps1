@@ -1,15 +1,21 @@
 ﻿<#
 .SYNOPSIS
-    Build claude-chat2md và đóng gói bản portable (thư mục + file .zip).
+    Build claude-chat2md và đóng gói bản portable.
+
+.DESCRIPTION
+    Bản chạy được ghi đè vào -OutDir (không tách thư mục theo phiên bản; thư mục
+    'logs' có sẵn ở đó được giữ nguyên). File .zip kèm số phiên bản vẫn nằm trong dist\.
 
 .EXAMPLE
-    .\build.ps1                 # go vet + go test + build + đóng gói vào dist\
+    .\build.ps1                 # go vet + go test + build + chép vào OutDir + zip vào dist\
     .\build.ps1 -SkipBuild      # chỉ đóng gói lại từ exe đã build
     .\build.ps1 -NoZip          # không tạo file .zip
+    .\build.ps1 -OutDir D:\Apps\claude-chat2md   # chép bản chạy vào thư mục khác
 #>
 [CmdletBinding()]
 param(
     [string]$Version,
+    [string]$OutDir = 'D:\Program\Portable\claude-chat2md\build',
     [switch]$SkipBuild,
     [switch]$NoZip
 )
@@ -26,7 +32,6 @@ if (-not $Version) {
 $ExeSrc  = Join-Path $Root "build\$AppName.exe"
 $DistDir = Join-Path $Root 'dist'
 $PkgName = "$AppName-portable-$Version"
-$PkgDir  = Join-Path $DistDir $PkgName
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 
@@ -56,12 +61,7 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $ExeSrc)) { throw "Exe not found: $ExeSrc" }
 
-Step "Đóng gói: $PkgDir"
-if (Test-Path $PkgDir) { Remove-Item $PkgDir -Recurse -Force }
-New-Item -ItemType Directory -Path $PkgDir | Out-Null
-Copy-Item $ExeSrc $PkgDir
-
-@"
+$ReadmeText = @"
 $AppName - phiên bản $Version
 ================================
 - Chạy $AppName.exe, chọn thư mục dữ liệu chat (mặc định %USERPROFILE%\.claude\projects)
@@ -70,13 +70,36 @@ $AppName - phiên bản $Version
 - File Markdown xuất ra chứa nguyên nội dung chat: xem lại trước khi chia sẻ.
 - Nhật ký ở thư mục 'logs' cạnh file exe (hoặc %LOCALAPPDATA%\$AppName\logs nếu không có quyền ghi),
   tự xóa sau 7 ngày. Nút "Mở thư mục log" trong ứng dụng mở thẳng thư mục này.
-"@ | Set-Content -Path (Join-Path $PkgDir 'DOC-TRUOC.txt') -Encoding UTF8
+"@
+
+# Chép exe + hướng dẫn vào một thư mục (ghi đè file cũ, không xóa thư mục)
+function Write-Package($dir) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Copy-Item $ExeSrc $dir -Force
+    $ReadmeText | Set-Content -Path (Join-Path $dir 'DOC-TRUOC.txt') -Encoding UTF8
+}
+
+Step "Chép bản chạy vào: $OutDir"
+Write-Package $OutDir
 
 if (-not $NoZip) {
     $Zip = Join-Path $DistDir "$PkgName.zip"
     Step "Nén: $Zip"
+    # Chỉ lấy exe + hướng dẫn từ OutDir (bỏ qua logs), đặt trong thư mục tên có phiên bản
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
     if (Test-Path $Zip) { Remove-Item $Zip -Force }
-    Compress-Archive -Path $PkgDir -DestinationPath $Zip -CompressionLevel Optimal
+    $Archive = [IO.Compression.ZipFile]::Open($Zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in "$AppName.exe", 'DOC-TRUOC.txt') {
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $Archive, (Join-Path $OutDir $name), "$PkgName/$name",
+                [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+        }
+    }
+    finally {
+        $Archive.Dispose()
+    }
 }
 
-Step "Hoàn tất: $PkgDir"
+Step "Hoàn tất: $OutDir"

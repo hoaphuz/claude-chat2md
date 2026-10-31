@@ -56,8 +56,11 @@ Example: `claude-chat2md -tools ~/.claude/projects ~/Documents/claude-export`
 Requires Go 1.21+.
 
 ```powershell
-# Windows: vet + test + GUI build + portable zip in dist\
+# Windows: vet + test + GUI build, copy the exe into -OutDir (overwritten in place,
+# existing logs kept) + versioned portable zip in dist\
 .\build.ps1
+.\build.ps1 -OutDir D:\Apps\claude-chat2md   # pick another output folder
+.\build.ps1 -SkipBuild -NoZip                # recopy only, no zip
 
 # Quick Windows GUI build
 go build -trimpath -ldflags "-H=windowsgui -s" -o claude-chat2md.exe

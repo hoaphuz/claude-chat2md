@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```powershell
 go run .                           # dev: opens the GUI (plus a console); logs go to the project's dev\logs
 go run ./tools/mkrsrc              # regenerate rsrc_windows_amd64.syso (app icon) from assets\icons\png\app-icon.ico
-.\build.ps1                        # mkrsrc + vet + test + GUI build (build\claude-chat2md.exe) + portable zip in dist\
+.\build.ps1                        # mkrsrc + vet + test + GUI build (build\claude-chat2md.exe), copy exe over -OutDir (default D:\Program\Portable\claude-chat2md\build, no per-version dirs, keeps logs) + versioned zip in dist\
 .\build.ps1 -SkipBuild -NoZip      # repackage only, no zip
 go build -ldflags "-H=windowsgui -s" -o claude-chat2md.exe   # quick Windows GUI build
 $env:GOOS="linux"; go build -o claude-chat2md; Remove-Item Env:GOOS   # macOS/Linux CLI cross-build
