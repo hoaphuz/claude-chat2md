@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -24,7 +25,16 @@ type Options struct {
 	TitleName bool // đặt tên file theo tiêu đề phiên thay vì mã session
 
 	Incremental bool // bỏ qua file nguồn không đổi kể từ lần xuất trước (xem state.go)
+
+	// Nhóm chat tạo trong VS Code (xem vscode.go).
+	GroupHeader  bool     // ghi tên nhóm vào phần đầu file .md
+	GroupFolders bool     // xếp file .md vào thư mục con theo nhóm
+	VSCodeDirs   []string // chỗ tìm thêm dữ liệu VS Code (bản portable, file state.vscdb)
+
+	groups *sessionGroups // ConvertAll nạp khi bật một trong hai tùy chọn nhóm
 }
+
+func (o Options) useGroups() bool { return o.GroupHeader || o.GroupFolders }
 
 // Result là thống kê sau khi chuyển.
 type Result struct {
@@ -349,6 +359,11 @@ func ConvertFile(file string, opt Options) (md, title string, err error) {
 	if cwd != "" {
 		sb.WriteString("- **Thư mục dự án:** `" + cwd + "`\n")
 	}
+	if opt.GroupHeader {
+		if g := opt.groups.of(session); g != "" {
+			sb.WriteString("- **Nhóm:** " + g + "\n")
+		}
+	}
 	if t := formatTime(firstTime); t != "" {
 		sb.WriteString("- **Bắt đầu:** " + t + "\n")
 	}
@@ -389,18 +404,51 @@ func safeFileName(title string) string {
 
 // uniqueName trả về tên file (kèm .md) chưa bị file nguồn khác giữ trong used
 // (khóa: đường dẫn .md viết thường, giá trị: khóa file nguồn sở hữu), thêm " (2)",
-// " (3)"… khi trùng, rồi giữ tên đó cho owner.
-func uniqueName(dir, name, owner string, used map[string]string) string {
-	key := func(c string) string { return strings.ToLower(filepath.Join(dir, c+".md")) }
+// " (3)"… khi trùng, rồi giữ tên đó cho owner. Tên chưa ai giữ nhưng foreign(đường dẫn
+// tương đối) trả về true (file có sẵn trên đĩa không phải của chat này) cũng bị bỏ qua.
+func uniqueName(dir, name, owner string, used map[string]string, foreign func(rel string) bool) string {
+	rel := func(c string) string { return filepath.Join(dir, c+".md") }
 	cand := name
 	for i := 2; ; i++ {
-		if o, taken := used[key(cand)]; !taken || o == owner {
+		o, taken := used[strings.ToLower(rel(cand))]
+		if o == owner && taken {
+			break
+		}
+		if !taken && (foreign == nil || !foreign(rel(cand))) {
 			break
 		}
 		cand = fmt.Sprintf("%s (%d)", name, i)
 	}
-	used[key(cand)] = owner
+	used[strings.ToLower(rel(cand))] = owner
 	return cand + ".md"
+}
+
+var reSessionLine = regexp.MustCompile("(?m)^- \\*\\*Session:\\*\\* `([^`]+)`")
+
+// mdSession đọc mã phiên trong phần đầu một file .md do ứng dụng xuất;
+// "" nếu không đọc được hoặc không có (file không do ứng dụng tạo).
+func mdSession(p string) string {
+	f, err := os.Open(p)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, 4096) // dòng Session nằm ngay dưới tiêu đề
+	n, _ := io.ReadFull(f, buf)
+	if m := reSessionLine.FindSubmatch(buf[:n]); m != nil {
+		return string(m[1])
+	}
+	return ""
+}
+
+// foreignFile: tại outRoot/rel đã có file mà không phải bản xuất của phiên session
+// (file người dùng tự tạo, của công cụ khác, hoặc của chat khác) — không được ghi đè.
+func foreignFile(outRoot, rel, session string) bool {
+	p := filepath.Join(outRoot, rel)
+	if _, err := os.Lstat(p); err != nil {
+		return false
+	}
+	return !strings.EqualFold(mdSession(p), session)
 }
 
 // safeConvert chuyển một file; panic chỉ làm hỏng file đó, không dừng cả lượt.
@@ -511,6 +559,15 @@ func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
 	}
 	logInfo("Tìm thấy %d file .jsonl", len(files))
 
+	if opt.useGroups() {
+		opt.groups = loadSessionGroups(opt.VSCodeDirs)
+		if opt.groups.groups == 0 {
+			logWarn("Không tìm thấy nhóm chat nào trong dữ liệu VS Code; các chat được xuất như chưa phân nhóm")
+		} else {
+			logInfo("Đọc được %d nhóm chat từ VS Code (%d chat đã phân nhóm)", opt.groups.groups, len(opt.groups.bySession))
+		}
+	}
+
 	state := loadState(outRoot)
 	fk := formatKey(opt)
 
@@ -518,6 +575,9 @@ func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
 	// file nguồn của nó, để file khác (mới, trùng tiêu đề) không ghi đè lên.
 	type job struct {
 		src, key, dir string // dir: thư mục con (tương đối) trong đầu ra
+		baseDir       string // dir khi chưa thêm thư mục nhóm
+		groupDir      string // thư mục nhóm đã thêm vào dir ("" nếu không)
+		fk            string // formatKey, kèm tên nhóm khi dùng nhóm
 		size, mod     int64
 		prev          stateEntry
 		hasPrev       bool
@@ -525,18 +585,28 @@ func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
 	used := map[string]string{}
 	var jobs []job
 	for _, f := range files {
-		j := job{src: f.path, key: stateKey(f.path)}
+		j := job{src: f.path, key: stateKey(f.path), fk: fk}
 		rel, err := filepath.Rel(f.base, f.path)
 		if err != nil {
 			rel = filepath.Base(f.path)
 		}
 		j.dir = filepath.Dir(rel)
+		j.baseDir = j.dir
+		if opt.useGroups() {
+			// Đổi nhóm không làm file .jsonl thay đổi, nên đưa tên nhóm vào khóa định dạng.
+			g := opt.groups.of(strings.TrimSuffix(filepath.Base(f.path), filepath.Ext(f.path)))
+			j.fk += " group=" + g
+			if opt.GroupFolders && g != "" {
+				j.groupDir = groupDirName(g)
+				j.dir = filepath.Join(j.dir, j.groupDir)
+			}
+		}
 		j.size, j.mod, _ = fileSig(f.path)
 		j.prev, j.hasPrev = state[j.key]
 		if j.hasPrev && j.prev.Out != "" {
 			used[strings.ToLower(j.prev.Out)] = j.key
 		}
-		if opt.Incremental && !f.explicit && j.hasPrev && j.prev.Size == j.size && j.prev.ModTime == j.mod && j.prev.Format == fk {
+		if opt.Incremental && !f.explicit && j.hasPrev && j.prev.Size == j.size && j.prev.ModTime == j.mod && j.prev.Format == j.fk {
 			if j.prev.Out == "" {
 				res.Unchanged++ // chat trống, không đổi
 				continue
@@ -563,17 +633,24 @@ func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
 		}
 		if md == "" {
 			res.Skipped++
-			state[j.key] = stateEntry{Size: j.size, ModTime: j.mod, Format: fk}
+			state[j.key] = stateEntry{Size: j.size, ModTime: j.mod, Format: j.fk}
 			logDebug("Skipped (no messages): %s", j.src)
 			continue
 		}
-		name := strings.TrimSuffix(filepath.Base(j.src), filepath.Ext(j.src))
+		session := strings.TrimSuffix(filepath.Base(j.src), filepath.Ext(j.src))
+		name := session
 		if opt.TitleName {
 			if n := safeFileName(title); n != "" {
 				name = n
 			}
 		}
-		rel := filepath.Join(j.dir, uniqueName(j.dir, name, j.key, used))
+		rel := filepath.Join(j.dir, uniqueName(j.dir, name, j.key, used, func(r string) bool {
+			if foreignFile(outRoot, r, session) {
+				logInfo("Giữ nguyên tệp có sẵn không phải bản xuất của chat này: %s", r)
+				return true
+			}
+			return false
+		}))
 		dest := filepath.Join(outRoot, rel)
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			res.Failed++
@@ -589,12 +666,13 @@ func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
 		logInfo("Đã xuất: %s", rel)
 		logDebug("Wrote %s (%d bytes) in %s", dest, len(md), time.Since(t0))
 
-		e := stateEntry{Size: j.size, ModTime: j.mod, Format: fk, Out: rel}
+		e := stateEntry{Size: j.size, ModTime: j.mod, Format: j.fk, Out: rel, GroupDir: j.groupDir}
 		e.OutSize, e.OutMod, _ = fileSig(dest)
 		state[j.key] = e
-		// Cùng thư mục mà ra tên khác (đổi tên phiên, bật/tắt đặt tên theo tiêu đề): dọn file cũ.
+		// Cùng thư mục dự án mà ra tên khác (đổi tên phiên, bật/tắt đặt tên theo tiêu đề,
+		// đổi nhóm hoặc bật/tắt thư mục nhóm): dọn file cũ.
 		if j.hasPrev && j.prev.Out != "" && !strings.EqualFold(j.prev.Out, rel) &&
-			strings.EqualFold(filepath.Dir(j.prev.Out), j.dir) {
+			strings.EqualFold(j.prev.baseDir(), j.baseDir) {
 			removeStale(outRoot, j.prev)
 		}
 	}

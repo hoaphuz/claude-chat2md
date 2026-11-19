@@ -24,7 +24,7 @@ func TestAddRecent(t *testing.T) {
 }
 
 func TestSettingsRoundTrip(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "sub", "settings.json")
+	p := filepath.Join(tempDir(t), "sub", "settings.json")
 	if s := loadSettings(p); s.LastOut != "" || len(s.RecentOut) != 0 {
 		t.Fatalf("missing file should give empty settings, got %+v", s)
 	}

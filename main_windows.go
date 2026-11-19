@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"unicode/utf16"
 	"unsafe"
@@ -58,9 +60,15 @@ var (
 	pSetProcessDPIAware   = user32.NewProc("SetProcessDPIAware")
 	pSetFocus             = user32.NewProc("SetFocus")
 
-	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
-	pCreateActCtxW    = kernel32.NewProc("CreateActCtxW")
-	pActivateActCtx   = kernel32.NewProc("ActivateActCtx")
+	pGetModuleHandleW      = kernel32.NewProc("GetModuleHandleW")
+	pCreateToolhelp32Snap  = kernel32.NewProc("CreateToolhelp32Snapshot")
+	pProcess32FirstW       = kernel32.NewProc("Process32FirstW")
+	pProcess32NextW        = kernel32.NewProc("Process32NextW")
+	pOpenProcess           = kernel32.NewProc("OpenProcess")
+	pQueryFullProcessImage = kernel32.NewProc("QueryFullProcessImageNameW")
+	pCloseHandle           = kernel32.NewProc("CloseHandle")
+	pCreateActCtxW         = kernel32.NewProc("CreateActCtxW")
+	pActivateActCtx        = kernel32.NewProc("ActivateActCtx")
 
 	pCreateFontW     = gdi32.NewProc("CreateFontW")
 	pGetDeviceCaps   = gdi32.NewProc("GetDeviceCaps")
@@ -74,6 +82,10 @@ var (
 	pCoTaskMemFree  = ole32.NewProc("CoTaskMemFree")
 
 	pInitCommonControlsEx = comctl32.NewProc("InitCommonControlsEx")
+	pTaskDialogIndirect   = comctl32.NewProc("TaskDialogIndirect")
+
+	pGetSystemMenu = user32.NewProc("GetSystemMenu")
+	pAppendMenuW   = user32.NewProc("AppendMenuW")
 )
 
 const (
@@ -100,6 +112,13 @@ const (
 	bsGroupBox      = 0x7
 
 	wmDestroy  = 0x0002
+	wmHelp     = 0x0053
+	wmKeyDown  = 0x0100
+	wmSysCmd   = 0x0112
+	vkF1       = 0x70
+	mfString   = 0x0000
+	mfSep      = 0x0800
+	idSysAbout = 0x0010 // lệnh menu hệ thống: < 0xF000 và chia hết cho 16
 	wmSetFont  = 0x0030
 	wmCommand  = 0x0111
 	wmApp      = 0x8000
@@ -160,6 +179,9 @@ const (
 	fnerrBufferTooSmall = 0x3003
 	openFileBufLen      = 1 << 16 // ký tự UTF-16, đủ cho vài trăm file
 
+	th32csSnapProcess              = 0x2
+	processQueryLimitedInformation = 0x1000
+
 	iccStandardClasses = 0x4000
 	iccWin95Classes    = 0x00FF
 	coinitApartment    = 0x2
@@ -180,6 +202,10 @@ const (
 	idOpenLog
 	idLog
 	idSrcFileBtn
+	idChkGroupHeader
+	idChkGroupDirs
+	idVSCodeBtn
+	idHelpBtn
 )
 
 type wndClassEx struct {
@@ -222,6 +248,20 @@ type openFileName struct {
 	pvReserved        uintptr
 	dwReserved        uint32
 	flagsEx           uint32
+}
+
+// processEntry32 là PROCESSENTRY32W.
+type processEntry32 struct {
+	dwSize              uint32
+	cntUsage            uint32
+	th32ProcessID       uint32
+	th32DefaultHeapID   uintptr
+	th32ModuleID        uint32
+	cntThreads          uint32
+	th32ParentProcessID uint32
+	pcPriClassBase      int32
+	dwFlags             uint32
+	szExeFile           [260]uint16
 }
 
 type point struct{ x, y int32 }
@@ -390,6 +430,7 @@ var (
 	hSrc, hOut, hTools, hThinking uintptr
 	hTitle, hIncr, hOpen, hRun    uintptr
 	hOpenOut, hLog                uintptr
+	hGroupHeader, hGroupDirs      uintptr
 	dpi                           = 96
 	events                        = make(chan event, 512)
 	running                       bool
@@ -567,6 +608,111 @@ func openFolder(path string) {
 	call(pShellExecuteW, hwndMain, ptr(wstr("open")), ptr(wstr(path)), 0, 0, swShowNormal)
 }
 
+// ---------- VS Code portable ----------
+
+// runningPortableVSCode trả về thư mục user-data của các VS Code portable (và bản dựng
+// cùng họ) đang chạy, tức exe có thư mục data\user-data bên cạnh.
+func runningPortableVSCode() []string {
+	snap := call(pCreateToolhelp32Snap, th32csSnapProcess, 0)
+	if snap == ^uintptr(0) {
+		return nil
+	}
+	defer call(pCloseHandle, snap)
+	names := map[string]bool{}
+	for _, n := range vscodeAppNames {
+		names[strings.ToLower(n)+".exe"] = true
+	}
+	var dirs []string
+	seen := map[string]bool{}
+	var pe processEntry32
+	pe.dwSize = uint32(unsafe.Sizeof(pe))
+	for ok := call(pProcess32FirstW, snap, uintptr(unsafe.Pointer(&pe))) != 0; ok; ok = call(pProcess32NextW, snap, uintptr(unsafe.Pointer(&pe))) != 0 {
+		if !names[strings.ToLower(syscall.UTF16ToString(pe.szExeFile[:]))] {
+			continue
+		}
+		h := call(pOpenProcess, processQueryLimitedInformation, 0, uintptr(pe.th32ProcessID))
+		if h == 0 {
+			continue
+		}
+		buf := make([]uint16, 1024)
+		size := uint32(len(buf))
+		r := call(pQueryFullProcessImage, h, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)))
+		call(pCloseHandle, h)
+		if r == 0 {
+			continue
+		}
+		dir := filepath.Dir(syscall.UTF16ToString(buf[:size]))
+		if k := strings.ToLower(dir); !seen[k] {
+			seen[k] = true
+			if d := vscodeUserDataDir(filepath.Join(dir, "data")); d != "" {
+				dirs = append(dirs, d)
+			}
+		}
+	}
+	logDebug("Running portable VS Code user-data dirs: %q", dirs)
+	return dirs
+}
+
+// pickVSCodeDir cho người dùng chỉ định thư mục dữ liệu VS Code (thường là bản portable
+// chưa dò được), kiểm tra rồi ghi nhớ vào cài đặt và báo các nhóm đọc được.
+func pickVSCodeDir() {
+	initial := os.Getenv("APPDATA")
+	if len(settings.VSCodeDirs) > 0 {
+		initial = settings.VSCodeDirs[0]
+	}
+	p, ok := pickFolder("Chọn thư mục VS Code: với bản portable là thư mục chứa Code.exe; bản cài thường là %APPDATA%\\Code.", initial)
+	if !ok {
+		return
+	}
+	d := vscodeUserDataDir(p)
+	if d == "" {
+		msgBox(hwndMain, "Không thấy dữ liệu VS Code trong thư mục này:\n"+p+
+			"\n\nHãy chọn thư mục chứa Code.exe (bản portable), hoặc thư mục có thư mục con User\\globalStorage.", mbIconWarn)
+		return
+	}
+	settings.VSCodeDirs = addRecent(settings.VSCodeDirs, d)
+	saveSettings(settingsPath(), settings)
+
+	dbs := vscodeStateDBs([]string{d})
+	groups, sessions := 0, 0
+	for _, db := range dbs {
+		if !strings.HasPrefix(strings.ToLower(db), strings.ToLower(d)+string(filepath.Separator)) {
+			continue // bỏ các vị trí chuẩn, chỉ đếm thư mục vừa chọn
+		}
+		out := map[string]string{}
+		n, err := readGroupsFromDB(db, out)
+		if err != nil {
+			logDebug("Read session groups from %s failed: %v", db, err)
+			continue
+		}
+		groups += n
+		sessions += len(out)
+	}
+	logDebug("User picked VS Code dir %q → %q, %d groups", p, d, groups)
+	msgBox(hwndMain, "Đã ghi nhớ thư mục dữ liệu VS Code:\n"+d+
+		"\n\nĐọc được "+strconv.Itoa(groups)+" nhóm chat ("+strconv.Itoa(sessions)+" chat đã phân nhóm). Ứng dụng sẽ dùng thư mục này mỗi lần chuyển đổi.", mbIconInfo)
+}
+
+// vscodeDirsForRun ghi nhớ các VS Code portable đang chạy vào cài đặt và trả về danh sách
+// thư mục đã biết (bỏ thư mục không còn tồn tại).
+func vscodeDirsForRun() []string {
+	list := settings.VSCodeDirs
+	for _, d := range runningPortableVSCode() {
+		list = addRecent(list, d)
+	}
+	var keep []string
+	for _, d := range list {
+		if vscodeUserDataDir(d) != "" {
+			keep = append(keep, d)
+		}
+	}
+	if strings.Join(keep, "\x00") != strings.Join(settings.VSCodeDirs, "\x00") {
+		settings.VSCodeDirs = keep
+		saveSettings(settingsPath(), settings)
+	}
+	return keep
+}
+
 // ---------- chuyển đổi ----------
 
 func startConvert() {
@@ -584,7 +730,11 @@ func startConvert() {
 			return
 		}
 	}
-	opt := Options{Tools: isChecked(hTools), Thinking: isChecked(hThinking), TitleName: isChecked(hTitle), Incremental: isChecked(hIncr)}
+	opt := Options{Tools: isChecked(hTools), Thinking: isChecked(hThinking), TitleName: isChecked(hTitle), Incremental: isChecked(hIncr),
+		GroupHeader: isChecked(hGroupHeader), GroupFolders: isChecked(hGroupDirs)}
+	if opt.GroupHeader || opt.GroupFolders {
+		opt.VSCodeDirs = vscodeDirsForRun()
+	}
 
 	running = true
 	lastOutDir = out
@@ -655,6 +805,10 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 					setText(hSrc, JoinInputs(files))
 					remember(hSrc, JoinInputs(files), true)
 				}
+			case idVSCodeBtn:
+				pickVSCodeDir()
+			case idHelpBtn:
+				showAbout()
 			case idOutBtn:
 				if p, ok := pickFolder("Chọn thư mục lưu tệp Markdown:", getText(hOut)); ok {
 					setText(hOut, p)
@@ -678,6 +832,14 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			}
 		}
 		return 0
+	case wmHelp:
+		showAbout()
+		return 1
+	case wmSysCmd:
+		if wParam&0xFFF0 == idSysAbout {
+			showAbout()
+			return 0
+		}
 	case wmAppEvent:
 		drainEvents()
 		return 0
@@ -730,7 +892,7 @@ func main() {
 	call(pRegisterClassExW, uintptr(unsafe.Pointer(&wc)))
 
 	// Kích thước vùng nội dung (px ở 96 DPI)
-	const clientW, clientH = 560, 528
+	const clientW, clientH = 560, 576
 	style := uintptr(wsOverlapped | wsCaption | wsSysMenu | wsMinimizeBox)
 	r := rect{0, 0, int32(scale(clientW)), int32(scale(clientH))}
 	call(pAdjustWindowRectEx, uintptr(unsafe.Pointer(&r)), style, 0, wsExControlParent)
@@ -745,7 +907,13 @@ func main() {
 	// --- các điều khiển ---
 	// Ô nguồn và ô thư mục đầu ra là combobox: gõ tay được, nút sổ xuống hiện các mục dùng gần đây.
 	settings = loadSettings(settingsPath())
-	control("STATIC", "Dữ liệu chat của Claude Code (cả thư mục, hoặc một/nhiều tệp):", 0, 0, 16, 16, 528, 18, 0)
+	control("STATIC", "Dữ liệu chat của Claude Code (cả thư mục, hoặc một/nhiều tệp):", 0, 0, 16, 16, 490, 18, 0)
+	control("BUTTON", "?", wsTabStop|bsPushButton, 0, 516, 8, 28, 24, idHelpBtn)
+	// Mục "Giới thiệu…" trong menu biểu tượng góc trái thanh tiêu đề.
+	if sm := call(pGetSystemMenu, hwndMain, 0); sm != 0 {
+		call(pAppendMenuW, sm, mfSep, 0, 0)
+		call(pAppendMenuW, sm, mfString, idSysAbout, ptr(wstr("Giới thiệu và hướng dẫn…\tF1")))
+	}
 	hSrc = historyCombo(16, 38, 316, idSrcEdit, settings.RecentSrc, settings.LastSrc, DefaultSourceDir())
 	setButtonIcon(control("BUTTON", "Thư mục…", wsTabStop|bsPushButton, 0, 340, 37, 100, 28, idSrcBtn), "chat")
 	setButtonIcon(control("BUTTON", "Chọn tệp…", wsTabStop|bsPushButton, 0, 444, 37, 100, 28, idSrcFileBtn), "export-chat")
@@ -754,25 +922,29 @@ func main() {
 	hOut = historyCombo(16, 98, 424, idOutEdit, settings.RecentOut, settings.LastOut, DefaultOutputDir())
 	setButtonIcon(control("BUTTON", "Chọn…", wsTabStop|bsPushButton, 0, 448, 97, 96, 28, idOutBtn), "markdown-file")
 
-	control("BUTTON", "Tùy chọn", bsGroupBox, 0, 16, 138, 528, 148, 0)
+	control("BUTTON", "Tùy chọn", bsGroupBox, 0, 16, 138, 528, 196, 0)
 	hTools = control("BUTTON", "Kèm các lệnh Claude đã chạy và kết quả (thu gọn)", wsTabStop|bsAutoCheckBox, 0, 32, 160, 500, 22, idChkTools)
 	hThinking = control("BUTTON", "Kèm phần suy luận (thinking) của Claude", wsTabStop|bsAutoCheckBox, 0, 32, 184, 500, 22, idChkThinking)
 	hTitle = control("BUTTON", "Đặt tên tệp theo tên phiên chat (thay vì mã session)", wsTabStop|bsAutoCheckBox, 0, 32, 208, 500, 22, idChkTitle)
 	sendMsg(hTitle, bmSetCheck, bstChecked, 0)
 	hIncr = control("BUTTON", "Chỉ chuyển chat mới hoặc đã thay đổi (bỏ qua chat đã xuất)", wsTabStop|bsAutoCheckBox, 0, 32, 232, 500, 22, idChkIncremental)
 	sendMsg(hIncr, bmSetCheck, bstChecked, 0)
-	hOpen = control("BUTTON", "Mở thư mục đầu ra khi xong", wsTabStop|bsAutoCheckBox, 0, 32, 256, 500, 22, idChkOpen)
+	hGroupHeader = control("BUTTON", "Ghi tên nhóm chat (VS Code) vào đầu tệp", wsTabStop|bsAutoCheckBox, 0, 32, 256, 340, 22, idChkGroupHeader)
+	sendMsg(hGroupHeader, bmSetCheck, bstChecked, 0)
+	hGroupDirs = control("BUTTON", "Xếp tệp vào thư mục con theo nhóm chat", wsTabStop|bsAutoCheckBox, 0, 32, 280, 340, 22, idChkGroupDirs)
+	setButtonIcon(control("BUTTON", "Thư mục VS Code…", wsTabStop|bsPushButton, 0, 384, 266, 148, 28, idVSCodeBtn), "settings")
+	hOpen = control("BUTTON", "Mở thư mục đầu ra khi xong", wsTabStop|bsAutoCheckBox, 0, 32, 304, 500, 22, idChkOpen)
 	sendMsg(hOpen, bmSetCheck, bstChecked, 0)
 
-	hRun = control("BUTTON", "Chuyển đổi", wsTabStop|bsDefPushButton, 0, 16, 300, 150, 34, idRun)
-	hOpenOut = control("BUTTON", "Mở thư mục đầu ra", wsTabStop|bsPushButton, 0, 176, 300, 150, 34, idOpenOut)
-	hOpenLog := control("BUTTON", "Mở thư mục log", wsTabStop|bsPushButton, 0, 336, 300, 150, 34, idOpenLog)
+	hRun = control("BUTTON", "Chuyển đổi", wsTabStop|bsDefPushButton, 0, 16, 348, 150, 34, idRun)
+	hOpenOut = control("BUTTON", "Mở thư mục đầu ra", wsTabStop|bsPushButton, 0, 176, 348, 150, 34, idOpenOut)
+	hOpenLog := control("BUTTON", "Mở thư mục log", wsTabStop|bsPushButton, 0, 336, 348, 150, 34, idOpenLog)
 	setButtonIcon(hRun, "export-all")
 	setButtonIcon(hOpenOut, "folder-output")
 	setButtonIcon(hOpenLog, "history")
 
-	control("STATIC", "Nhật ký:", 0, 0, 16, 348, 528, 18, 0)
-	hLog = control("EDIT", "", wsTabStop|wsVScroll|esMultiline|esAutoVScroll|esReadOnly, wsExClientEdge, 16, 368, 528, 144, idLog)
+	control("STATIC", "Nhật ký:", 0, 0, 16, 396, 528, 18, 0)
+	hLog = control("EDIT", "", wsTabStop|wsVScroll|esMultiline|esAutoVScroll|esReadOnly, wsExClientEdge, 16, 416, 528, 144, idLog)
 	sendMsg(hLog, emLimitText, 0, 0) // bỏ giới hạn độ dài nhật ký
 	setLogSink(func(s string) { postEvent(event{text: s}) })
 	setText(hLog, "Bấm \"Chuyển đổi\" để bắt đầu. Dữ liệu gốc chỉ được đọc, không bị sửa hay xóa.")
@@ -786,6 +958,11 @@ func main() {
 		r := int32(call(pGetMessageW, uintptr(unsafe.Pointer(&m)), 0, 0, 0))
 		if r <= 0 {
 			break
+		}
+		// F1 ở bất kỳ ô nào: mở hộp giới thiệu (IsDialogMessage sẽ nuốt phím này).
+		if m.message == wmKeyDown && m.wParam == vkF1 {
+			showAbout()
+			continue
 		}
 		// IsDialogMessage giúp phím Tab di chuyển giữa các ô
 		if call(pIsDialogMessageW, hwndMain, uintptr(unsafe.Pointer(&m))) != 0 {

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.10.0 – 2026-11-19
+- Nút **?** ở góc trên bên phải (hoặc phím F1, hoặc mục "Giới thiệu và hướng dẫn…" trong menu biểu tượng góc trái thanh tiêu đề) mở hộp giới thiệu chương trình.
+- Hộp giới thiệu có link mở tài liệu hướng dẫn sử dụng và trang dự án trên GitHub.
+
+## 0.9.0 – 2026-11-19
+- Không còn ghi đè file `.md` có sẵn trùng tên mà không phải bản xuất của chat đó (ghi chú tự tạo, file của công cụ khác…): chat được đặt tên mới có `(2)`, `(3)`…
+- Lỡ xóa file trạng thái `.claude-chat2md-state.json` thì các bản xuất cũ vẫn được nhận ra (qua dòng Session) và ghi đè đúng chỗ, không sinh bản trùng.
+- Nút mới **Thư mục VS Code…** để chỉ định bằng tay nơi đọc nhóm chat (hữu ích với VS Code portable đang tắt); báo ngay số nhóm đọc được.
+
+## 0.8.0 – 2026-11-19
+- Hỗ trợ nhóm chat tạo trong VS Code (khung Session Manager → New group). Tùy chọn mới "Ghi tên nhóm chat vào đầu tệp" (mặc định bật) thêm dòng **Nhóm** vào đầu file.
+- Tùy chọn mới "Xếp tệp vào thư mục con theo nhóm chat" (mặc định tắt): mỗi nhóm một thư mục con trong thư mục dự án.
+- Đổi nhóm của chat thì lần chuyển sau file được dời sang đúng chỗ, file cũ (chưa sửa) và thư mục nhóm trống được dọn.
+- Tự tìm dữ liệu VS Code, kể cả bản portable đang mở. Bản dòng lệnh dùng cờ `-group`, `-group-dirs`, `-vscode`.
+
 ## 0.7.0 – 2026-11-19
 - Ô dữ liệu chat (nguồn) và ô thư mục lưu tệp Markdown đều nhớ giá trị dùng lần cuối, mở lại phần mềm không còn về mặc định.
 - Nút sổ xuống ở hai ô này hiện 10 mục dùng gần đây để chọn lại nhanh.

@@ -15,10 +15,13 @@ func main() {
 	thinking := flag.Bool("thinking", false, "kèm phần suy luận của Claude")
 	title := flag.Bool("title", false, "đặt tên file theo tên phiên chat thay vì mã session")
 	update := flag.Bool("update", false, "chỉ chuyển chat mới hoặc đã thay đổi kể từ lần xuất trước")
+	groupHeader := flag.Bool("group", false, "ghi tên nhóm chat (nhóm tạo trong VS Code) vào đầu file")
+	groupDirs := flag.Bool("group-dirs", false, "xếp file vào thư mục con theo nhóm chat")
+	vscode := flag.String("vscode", "", "thư mục dữ liệu VS Code (bản portable) hoặc file state.vscdb để đọc nhóm chat")
 	outFlag := flag.String("o", "", "thư mục đầu ra; khi có cờ này, mọi tham số còn lại là nguồn")
 	version := flag.Bool("version", false, "in số phiên bản")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Cách dùng: claude-chat2md [-tools] [-thinking] [-title] [-update] [file.jsonl | thư-mục] [thư-mục-đầu-ra]")
+		fmt.Fprintln(os.Stderr, "Cách dùng: claude-chat2md [-tools] [-thinking] [-title] [-update] [-group] [-group-dirs] [-vscode dir] [file.jsonl | thư-mục] [thư-mục-đầu-ra]")
 		fmt.Fprintln(os.Stderr, "      hoặc: claude-chat2md [cờ…] -o thư-mục-đầu-ra file.jsonl|thư-mục …")
 		flag.PrintDefaults()
 	}
@@ -54,7 +57,12 @@ func main() {
 	logDebug("%s %s started (CLI), log dir %q", appName, appVersion, dir)
 	setLogSink(func(s string) { fmt.Println(s) })
 
-	res, err := ConvertAll(inputs, out, Options{Tools: *tools, Thinking: *thinking, TitleName: *title, Incremental: *update})
+	opt := Options{Tools: *tools, Thinking: *thinking, TitleName: *title, Incremental: *update,
+		GroupHeader: *groupHeader, GroupFolders: *groupDirs}
+	if *vscode != "" {
+		opt.VSCodeDirs = []string{*vscode}
+	}
+	res, err := ConvertAll(inputs, out, opt)
 	if err != nil {
 		logDebug("ConvertAll failed: %v", err)
 		fmt.Fprintln(os.Stderr, err)

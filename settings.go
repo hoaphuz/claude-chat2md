@@ -20,6 +20,9 @@ type Settings struct {
 	RecentSrc []string `json:"recentSrc,omitempty"`
 	LastOut   string   `json:"lastOut,omitempty"`
 	RecentOut []string `json:"recentOut,omitempty"`
+
+	// Thư mục VS Code portable đã thấy đang chạy, để đọc nhóm chat cả khi VS Code đã tắt.
+	VSCodeDirs []string `json:"vscodeDirs,omitempty"`
 }
 
 var cachedSettingsPath *string

@@ -9,7 +9,7 @@ import (
 )
 
 func TestLoggerWritesFilesAndSink(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	var ui []string
 	lg.mu.Lock()
 	lg.dir, lg.sink = dir, func(s string) { ui = append(ui, s) }
@@ -38,7 +38,7 @@ func TestLoggerWritesFilesAndSink(t *testing.T) {
 }
 
 func TestCleanOldLogsOnlyOwnFiles(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	old := time.Now().AddDate(0, 0, -30)
 	for _, n := range []string{"2026-01-01.log", "debug-2026-01-01.log", "ghichu.txt", "khac.log"} {
 		p := filepath.Join(dir, n)

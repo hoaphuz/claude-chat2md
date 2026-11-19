@@ -21,7 +21,7 @@ func writeJSONL(t *testing.T, dir, name string, lines ...string) string {
 }
 
 func TestConvertFileTitlePriority(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempDir(t)
 	cases := []struct {
 		name  string
 		lines []string
@@ -61,7 +61,7 @@ func TestSafeFileName(t *testing.T) {
 }
 
 func TestConvertAllTitleName(t *testing.T) {
-	src, out := t.TempDir(), t.TempDir()
+	src, out := tempDir(t), tempDir(t)
 	writeJSONL(t, src, "aaa.jsonl", `{"type":"ai-title","aiTitle":"Cùng tên"}`, testUserLine)
 	writeJSONL(t, src, "bbb.jsonl", `{"type":"ai-title","aiTitle":"Cùng tên"}`, testUserLine)
 	writeJSONL(t, src, "ccc.jsonl", `{"type":"ai-title","aiTitle":"???"}`, testUserLine)
@@ -77,12 +77,50 @@ func TestConvertAllTitleName(t *testing.T) {
 	}
 
 	// Tắt tùy chọn: giữ tên theo mã session.
-	out2 := t.TempDir()
+	out2 := tempDir(t)
 	if _, err := ConvertAll([]string{src}, out2, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(out2, "aaa.md")); err != nil {
 		t.Errorf("expected aaa.md: %v", err)
+	}
+}
+
+// File .md có sẵn không do ứng dụng xuất cho chat đó thì không bị ghi đè.
+func TestConvertAllKeepsForeignFile(t *testing.T) {
+	src, out := tempDir(t), tempDir(t)
+	writeJSONL(t, src, "aaa.jsonl", `{"type":"ai-title","aiTitle":"Ghi chú"}`, testUserLine)
+	note := filepath.Join(out, "Ghi chú.md")
+	os.WriteFile(note, []byte("# Ghi chú riêng của tôi\n"), 0o644)
+
+	if _, err := ConvertAll([]string{src}, out, Options{TitleName: true}); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(note); string(data) != "# Ghi chú riêng của tôi\n" {
+		t.Errorf("user file overwritten: %q", data)
+	}
+	if names := mdFiles(t, out); strings.Join(names, "|") != "Ghi chú (2).md|Ghi chú.md" {
+		t.Errorf("files %v", names)
+	}
+}
+
+// Mất file trạng thái: các bản xuất cũ (nhận ra nhờ dòng Session) được ghi đè đúng chỗ,
+// không sinh thêm bản trùng " (3)".
+func TestConvertAllLostStateNoDuplicates(t *testing.T) {
+	src, out := tempDir(t), tempDir(t)
+	writeJSONL(t, src, "aaa.jsonl", `{"type":"ai-title","aiTitle":"Cùng tên"}`, testUserLine)
+	writeJSONL(t, src, "bbb.jsonl", `{"type":"ai-title","aiTitle":"Cùng tên"}`, testUserLine)
+	for i := 0; i < 2; i++ {
+		if _, err := ConvertAll([]string{src}, out, Options{TitleName: true}); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(filepath.Join(out, stateFileName))
+	}
+	if names := mdFiles(t, out); strings.Join(names, "|") != "Cùng tên (2).md|Cùng tên.md" {
+		t.Errorf("files %v", names)
+	}
+	if s := mdSession(filepath.Join(out, "Cùng tên.md")); s != "aaa" {
+		t.Errorf("Cùng tên.md belongs to %q, want aaa", s)
 	}
 }
 
@@ -112,7 +150,7 @@ func touch(t *testing.T, p string, sec int64) {
 }
 
 func TestConvertAllIncremental(t *testing.T) {
-	src, out := t.TempDir(), t.TempDir()
+	src, out := tempDir(t), tempDir(t)
 	a := writeJSONL(t, src, "aaa.jsonl", `{"type":"ai-title","aiTitle":"Phiên A"}`, testUserLine)
 	b := writeJSONL(t, src, "bbb.jsonl", `{"type":"ai-title","aiTitle":"Phiên B"}`, testUserLine)
 	writeJSONL(t, src, "empty.jsonl", `{"type":"summary","summary":"x"}`)
@@ -170,7 +208,7 @@ func TestConvertAllIncremental(t *testing.T) {
 }
 
 func TestRemoveStaleKeepsEditedFile(t *testing.T) {
-	src, out := t.TempDir(), t.TempDir()
+	src, out := tempDir(t), tempDir(t)
 	a := writeJSONL(t, src, "aaa.jsonl", `{"type":"ai-title","aiTitle":"Tên 1"}`, testUserLine)
 	touch(t, a, 1000)
 	opt := Options{TitleName: true, Incremental: true}
@@ -208,7 +246,7 @@ func TestSplitInputs(t *testing.T) {
 
 func TestConvertAllSelectedFiles(t *testing.T) {
 	// Giả lập thư mục projects của Claude Code với hai dự án.
-	cfg := t.TempDir()
+	cfg := tempDir(t)
 	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
 	p1 := filepath.Join(cfg, "projects", "d--proj1")
 	p2 := filepath.Join(cfg, "projects", "d--proj2")
@@ -221,10 +259,10 @@ func TestConvertAllSelectedFiles(t *testing.T) {
 	writeJSONL(t, p1, "bbb.jsonl", `{"type":"ai-title","aiTitle":"B"}`, testUserLine)
 	c := writeJSONL(t, p2, "ccc.jsonl", `{"type":"ai-title","aiTitle":"C"}`, testUserLine)
 	// File nằm ngoài thư mục projects: xuất thẳng vào thư mục đầu ra.
-	other := t.TempDir()
+	other := tempDir(t)
 	d := writeJSONL(t, other, "ddd.jsonl", `{"type":"ai-title","aiTitle":"D"}`, testUserLine)
 
-	out := t.TempDir()
+	out := tempDir(t)
 	opt := Options{TitleName: true, Incremental: true}
 	res, err := ConvertAll([]string{a, c, d, a}, out, opt) // a trùng: chỉ chuyển một lần
 	if err != nil || res.OK != 3 {

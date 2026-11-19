@@ -16,12 +16,22 @@ const stateFileName = ".claude-chat2md-state.json"
 
 // stateEntry là thông tin lần xuất gần nhất của một file .jsonl nguồn.
 type stateEntry struct {
-	Size    int64  `json:"size"`               // kích thước file nguồn
-	ModTime int64  `json:"mtime"`              // thời điểm sửa file nguồn (UnixNano)
-	Format  string `json:"format"`             // phiên bản + tùy chọn đã dùng (formatKey)
-	Out     string `json:"out,omitempty"`      // file .md, tương đối so với thư mục đầu ra; "" = chat trống
-	OutSize int64  `json:"outSize,omitempty"`  // kích thước file .md lúc ghi
-	OutMod  int64  `json:"outMtime,omitempty"` // thời điểm ghi file .md (UnixNano)
+	Size     int64  `json:"size"`               // kích thước file nguồn
+	ModTime  int64  `json:"mtime"`              // thời điểm sửa file nguồn (UnixNano)
+	Format   string `json:"format"`             // phiên bản + tùy chọn đã dùng (formatKey)
+	Out      string `json:"out,omitempty"`      // file .md, tương đối so với thư mục đầu ra; "" = chat trống
+	OutSize  int64  `json:"outSize,omitempty"`  // kích thước file .md lúc ghi
+	OutMod   int64  `json:"outMtime,omitempty"` // thời điểm ghi file .md (UnixNano)
+	GroupDir string `json:"groupDir,omitempty"` // thư mục nhóm đã thêm vào đường dẫn Out (nếu có)
+}
+
+// baseDir là thư mục của Out khi bỏ thư mục nhóm (tức thư mục dự án).
+func (e stateEntry) baseDir() string {
+	d := filepath.Dir(e.Out)
+	if e.GroupDir != "" {
+		d = filepath.Dir(d)
+	}
+	return d
 }
 
 type stateDoc struct {
@@ -30,7 +40,8 @@ type stateDoc struct {
 
 // formatKey: đổi phiên bản hoặc tùy chọn ảnh hưởng nội dung/tên file thì phải xuất lại.
 func formatKey(opt Options) string {
-	return fmt.Sprintf("%s tools=%t thinking=%t title=%t", appVersion, opt.Tools, opt.Thinking, opt.TitleName)
+	return fmt.Sprintf("%s tools=%t thinking=%t title=%t groupHeader=%t groupDirs=%t",
+		appVersion, opt.Tools, opt.Thinking, opt.TitleName, opt.GroupHeader, opt.GroupFolders)
 }
 
 // stateKey là khóa ổn định của một file nguồn (không phân biệt hoa thường trên Windows).
@@ -112,5 +123,11 @@ func removeStale(outRoot string, prev stateEntry) {
 		logDebug("Remove stale %s failed: %v", p, err)
 		return
 	}
-	logInfo("Đã xóa file cũ (tên phiên đã đổi): %s", prev.Out)
+	logInfo("Đã xóa file cũ (đã đổi tên hoặc nhóm): %s", prev.Out)
+	if prev.GroupDir != "" {
+		// Thư mục nhóm không còn file nào thì xóa luôn (os.Remove không xóa thư mục còn nội dung).
+		if err := os.Remove(filepath.Dir(p)); err == nil {
+			logDebug("Removed empty group dir %s", filepath.Dir(p))
+		}
+	}
 }
