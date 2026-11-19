@@ -19,13 +19,17 @@ import (
 
 // Options là các tùy chọn khi xuất.
 type Options struct {
-	Tools    bool // kèm lệnh gọi công cụ và kết quả
-	Thinking bool // kèm phần suy luận của Claude
+	Tools     bool // kèm lệnh gọi công cụ và kết quả
+	Thinking  bool // kèm phần suy luận của Claude
+	TitleName bool // đặt tên file theo tiêu đề phiên thay vì mã session
+
+	Incremental bool // bỏ qua file nguồn không đổi kể từ lần xuất trước (xem state.go)
 }
 
 // Result là thống kê sau khi chuyển.
 type Result struct {
 	OK, Skipped, Failed int
+	Unchanged           int // bỏ qua vì không đổi kể từ lần xuất trước
 }
 
 const maxToolChars = 3000 // cắt bớt kết quả công cụ quá dài
@@ -57,6 +61,7 @@ type entry struct {
 	Type        string   `json:"type"`
 	Summary     string   `json:"summary"`
 	CustomTitle string   `json:"customTitle"`
+	AITitle     string   `json:"aiTitle"`
 	Cwd         string   `json:"cwd"`
 	Timestamp   string   `json:"timestamp"`
 	IsSidechain bool     `json:"isSidechain"`
@@ -224,14 +229,15 @@ const (
 	roleClaude = "🤖 Claude"
 )
 
-// ConvertFile chuyển một file .jsonl; trả về "" nếu không có nội dung.
-func ConvertFile(file string, opt Options) (string, error) {
+// ConvertFile chuyển một file .jsonl; trả về md "" nếu không có nội dung.
+// title là tiêu đề phiên (dùng cho tiêu đề Markdown và tên file khi bật TitleName).
+func ConvertFile(file string, opt Options) (md, title string, err error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	var title, firstTime, cwd, lastRole string
+	var customTitle, aiTitle, firstTime, cwd, lastRole string
 	var body []string
 	st := &convStats{unknown: map[string]int{}}
 	defer func() {
@@ -257,7 +263,10 @@ func ConvertFile(file string, opt Options) (string, error) {
 			title = e.Summary
 		}
 		if e.Type == "custom-title" && e.CustomTitle != "" {
-			title = e.CustomTitle
+			customTitle = e.CustomTitle
+		}
+		if e.Type == "ai-title" && e.AITitle != "" {
+			aiTitle = e.AITitle // Claude Code tự đặt tên phiên; lấy bản mới nhất
 		}
 		if cwd == "" && e.Cwd != "" {
 			cwd = e.Cwd
@@ -310,10 +319,16 @@ func ConvertFile(file string, opt Options) (string, error) {
 	}
 
 	if len(body) == 0 {
-		return "", nil
+		return "", "", nil
 	}
 
 	session := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+	switch {
+	case customTitle != "":
+		title = customTitle
+	case aiTitle != "":
+		title = aiTitle
+	}
 	if title == "" {
 		title = session
 		for i := 1; i < len(body); i++ {
@@ -340,11 +355,56 @@ func ConvertFile(file string, opt Options) (string, error) {
 	sb.WriteString("\n")
 	sb.WriteString(strings.Join(body, "\n\n"))
 	sb.WriteString("\n")
-	return sb.String(), nil
+	return sb.String(), title, nil
+}
+
+// Ký tự không được phép trong tên file Windows (và "/" trên mọi hệ điều hành).
+var reBadName = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]+`)
+
+const maxNameRunes = 100
+
+// safeFileName biến tiêu đề phiên thành tên file hợp lệ (không gồm phần mở rộng);
+// trả về "" nếu không còn gì dùng được.
+func safeFileName(title string) string {
+	s := reBadName.ReplaceAllString(title, " ")
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxNameRunes {
+		s = string(r[:maxNameRunes])
+	}
+	s = strings.TrimRight(s, ". ")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Tên thiết bị dành riêng của Windows (CON, NUL, COM1…), kể cả khi có đuôi.
+	stem := strings.ToUpper(strings.SplitN(s, ".", 2)[0])
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		s = "_" + s
+	}
+	return s
+}
+
+// uniqueName trả về tên file (kèm .md) chưa bị file nguồn khác giữ trong used
+// (khóa: đường dẫn .md viết thường, giá trị: khóa file nguồn sở hữu), thêm " (2)",
+// " (3)"… khi trùng, rồi giữ tên đó cho owner.
+func uniqueName(dir, name, owner string, used map[string]string) string {
+	key := func(c string) string { return strings.ToLower(filepath.Join(dir, c+".md")) }
+	cand := name
+	for i := 2; ; i++ {
+		if o, taken := used[key(cand)]; !taken || o == owner {
+			break
+		}
+		cand = fmt.Sprintf("%s (%d)", name, i)
+	}
+	used[key(cand)] = owner
+	return cand + ".md"
 }
 
 // safeConvert chuyển một file; panic chỉ làm hỏng file đó, không dừng cả lượt.
-func safeConvert(file string, opt Options) (md string, err error) {
+func safeConvert(file string, opt Options) (md, title string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			logDebug("Panic converting %s: %v\n%s", file, r, debug.Stack())
@@ -354,25 +414,65 @@ func safeConvert(file string, opt Options) (md string, err error) {
 	return ConvertFile(file, opt)
 }
 
-// ConvertAll chuyển một file hoặc cả thư mục; nhật ký đi qua logInfo/logError/logDebug.
-func ConvertAll(input, outRoot string, opt Options) (Result, error) {
-	var res Result
-	start := time.Now()
-	logDebug("ConvertAll input=%q out=%q options=%+v", input, outRoot, opt)
-	st, err := os.Stat(input)
-	if err != nil {
-		logDebug("Stat input failed: %v", err)
-		return res, fmt.Errorf("không tìm thấy: %s", input)
-	}
-
-	base := input
-	var files []string
-	if !st.IsDir() {
-		base = filepath.Dir(input)
-		if strings.EqualFold(filepath.Ext(input), ".jsonl") {
-			files = []string{input}
+// SplitInputs tách ô nguồn thành danh sách đường dẫn: nhiều đường dẫn cách nhau
+// bằng ";", có thể bọc trong dấu ngoặc kép.
+func SplitInputs(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ";") {
+		p = strings.Trim(strings.TrimSpace(p), `"`)
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
-	} else {
+	}
+	return out
+}
+
+// JoinInputs là chiều ngược của SplitInputs, dùng để hiện danh sách file đã chọn.
+func JoinInputs(paths []string) string { return strings.Join(paths, "; ") }
+
+// fileBase là thư mục gốc để tính đường dẫn đầu ra của một file chọn lẻ: file nằm
+// trong thư mục projects của Claude Code thì giữ thư mục con theo dự án (giống khi
+// chuyển cả thư mục projects), còn lại thì đặt thẳng vào thư mục đầu ra.
+func fileBase(file string) string {
+	root := DefaultSourceDir()
+	if abs, err := filepath.Abs(file); err == nil {
+		if rel, err := filepath.Rel(root, abs); err == nil && rel != "." &&
+			!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
+			return root
+		}
+	}
+	return filepath.Dir(file)
+}
+
+// srcFile là một file .jsonl cần xét, kèm thư mục gốc để tính đường dẫn đầu ra.
+type srcFile struct {
+	path, base string
+	explicit   bool // người dùng chọn đích danh file này (luôn chuyển, kể cả khi không đổi)
+}
+
+// collectInputs gom các file .jsonl từ danh sách file/thư mục, bỏ trùng.
+func collectInputs(inputs []string) ([]srcFile, error) {
+	var files []srcFile
+	seen := map[string]bool{}
+	add := func(f srcFile) {
+		if k := stateKey(f.path); !seen[k] {
+			seen[k] = true
+			files = append(files, f)
+		}
+	}
+	for _, input := range inputs {
+		st, err := os.Stat(input)
+		if err != nil {
+			logDebug("Stat input failed: %v", err)
+			return nil, fmt.Errorf("không tìm thấy: %s", input)
+		}
+		if !st.IsDir() {
+			if !strings.EqualFold(filepath.Ext(input), ".jsonl") {
+				return nil, fmt.Errorf("không phải file chat .jsonl: %s", input)
+			}
+			add(srcFile{path: input, base: fileBase(input), explicit: true})
+			continue
+		}
 		_ = filepath.WalkDir(input, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				logDebug("Walk skipped %s: %v", p, err)
@@ -386,35 +486,94 @@ func ConvertAll(input, outRoot string, opt Options) (Result, error) {
 				return nil
 			}
 			if strings.EqualFold(filepath.Ext(d.Name()), ".jsonl") {
-				files = append(files, p)
+				add(srcFile{path: p, base: input})
 			}
 			return nil
 		})
 	}
+	return files, nil
+}
 
+// ConvertAll chuyển các file và/hoặc thư mục trong inputs; nhật ký đi qua logInfo/logError/logDebug.
+func ConvertAll(inputs []string, outRoot string, opt Options) (Result, error) {
+	var res Result
+	start := time.Now()
+	logDebug("ConvertAll inputs=%q out=%q options=%+v", inputs, outRoot, opt)
+	if len(inputs) == 0 {
+		return res, fmt.Errorf("chưa chọn thư mục hoặc file nguồn")
+	}
+	files, err := collectInputs(inputs)
+	if err != nil {
+		return res, err
+	}
 	if len(files) == 0 {
-		return res, fmt.Errorf("không có file .jsonl nào trong: %s", input)
+		return res, fmt.Errorf("không có file .jsonl nào trong: %s", JoinInputs(inputs))
 	}
 	logInfo("Tìm thấy %d file .jsonl", len(files))
 
+	state := loadState(outRoot)
+	fk := formatKey(opt)
+
+	// Lượt 1: xác định file cần chuyển. Tên .md đã xuất trước đó được giữ cho đúng
+	// file nguồn của nó, để file khác (mới, trùng tiêu đề) không ghi đè lên.
+	type job struct {
+		src, key, dir string // dir: thư mục con (tương đối) trong đầu ra
+		size, mod     int64
+		prev          stateEntry
+		hasPrev       bool
+	}
+	used := map[string]string{}
+	var jobs []job
 	for _, f := range files {
+		j := job{src: f.path, key: stateKey(f.path)}
+		rel, err := filepath.Rel(f.base, f.path)
+		if err != nil {
+			rel = filepath.Base(f.path)
+		}
+		j.dir = filepath.Dir(rel)
+		j.size, j.mod, _ = fileSig(f.path)
+		j.prev, j.hasPrev = state[j.key]
+		if j.hasPrev && j.prev.Out != "" {
+			used[strings.ToLower(j.prev.Out)] = j.key
+		}
+		if opt.Incremental && !f.explicit && j.hasPrev && j.prev.Size == j.size && j.prev.ModTime == j.mod && j.prev.Format == fk {
+			if j.prev.Out == "" {
+				res.Unchanged++ // chat trống, không đổi
+				continue
+			}
+			if _, _, ok := fileSig(filepath.Join(outRoot, j.prev.Out)); ok && strings.EqualFold(filepath.Dir(j.prev.Out), j.dir) {
+				res.Unchanged++
+				continue
+			}
+		}
+		jobs = append(jobs, j)
+	}
+	if opt.Incremental {
+		logInfo("Cần chuyển %d file mới hoặc đã thay đổi, bỏ qua %d file không đổi", len(jobs), res.Unchanged)
+	}
+
+	// Lượt 2: chuyển các file còn lại.
+	for _, j := range jobs {
 		t0 := time.Now()
-		md, err := safeConvert(f, opt)
+		md, title, err := safeConvert(j.src, opt)
 		if err != nil {
 			res.Failed++
-			logError("Lỗi: %s: %v", f, err)
+			logError("Lỗi: %s: %v", j.src, err)
 			continue
 		}
 		if md == "" {
 			res.Skipped++
-			logDebug("Skipped (no messages): %s", f)
+			state[j.key] = stateEntry{Size: j.size, ModTime: j.mod, Format: fk}
+			logDebug("Skipped (no messages): %s", j.src)
 			continue
 		}
-		rel, err := filepath.Rel(base, f)
-		if err != nil {
-			rel = filepath.Base(f)
+		name := strings.TrimSuffix(filepath.Base(j.src), filepath.Ext(j.src))
+		if opt.TitleName {
+			if n := safeFileName(title); n != "" {
+				name = n
+			}
 		}
-		rel = strings.TrimSuffix(rel, filepath.Ext(rel)) + ".md"
+		rel := filepath.Join(j.dir, uniqueName(j.dir, name, j.key, used))
 		dest := filepath.Join(outRoot, rel)
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			res.Failed++
@@ -429,6 +588,19 @@ func ConvertAll(input, outRoot string, opt Options) (Result, error) {
 		res.OK++
 		logInfo("Đã xuất: %s", rel)
 		logDebug("Wrote %s (%d bytes) in %s", dest, len(md), time.Since(t0))
+
+		e := stateEntry{Size: j.size, ModTime: j.mod, Format: fk, Out: rel}
+		e.OutSize, e.OutMod, _ = fileSig(dest)
+		state[j.key] = e
+		// Cùng thư mục mà ra tên khác (đổi tên phiên, bật/tắt đặt tên theo tiêu đề): dọn file cũ.
+		if j.hasPrev && j.prev.Out != "" && !strings.EqualFold(j.prev.Out, rel) &&
+			strings.EqualFold(filepath.Dir(j.prev.Out), j.dir) {
+			removeStale(outRoot, j.prev)
+		}
+	}
+
+	if err := saveState(outRoot, state); err != nil {
+		logWarn("Không lưu được trạng thái xuất (lần sau sẽ chuyển lại toàn bộ): %v", err)
 	}
 	logDebug("ConvertAll done: %+v in %s", res, time.Since(start))
 	return res, nil

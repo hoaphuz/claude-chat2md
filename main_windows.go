@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"syscall"
+	"unicode/utf16"
 	"unsafe"
 )
 
@@ -24,6 +25,10 @@ var (
 	shell32  = syscall.NewLazyDLL("shell32.dll")
 	ole32    = syscall.NewLazyDLL("ole32.dll")
 	comctl32 = syscall.NewLazyDLL("comctl32.dll")
+	comdlg32 = syscall.NewLazyDLL("comdlg32.dll")
+
+	pGetOpenFileNameW     = comdlg32.NewProc("GetOpenFileNameW")
+	pCommDlgExtendedError = comdlg32.NewProc("CommDlgExtendedError")
 
 	pRegisterClassExW     = user32.NewProc("RegisterClassExW")
 	pCreateWindowExW      = user32.NewProc("CreateWindowExW")
@@ -114,6 +119,13 @@ const (
 	appIconID  = 1 // RT_GROUP_ICON do tools/mkrsrc sinh
 	iconResVer = 0x00030000
 
+	cbsDropDown       = 0x0002
+	cbsAutoHScroll    = 0x0040
+	cbAddString       = 0x0143
+	cbResetContent    = 0x014B
+	cbSetItemHeight   = 0x0153
+	cbSetDroppedWidth = 0x0160
+
 	emSetSel     = 0x00B1
 	emScrollCrt  = 0x00B7
 	emReplaceSel = 0x00C2
@@ -139,6 +151,15 @@ const (
 	bffmInitialized     = 1
 	bffmSetSelectionW   = 0x0400 + 103
 
+	ofnHideReadOnly     = 0x00000004
+	ofnNoChangeDir      = 0x00000008
+	ofnAllowMultiSelect = 0x00000200
+	ofnPathMustExist    = 0x00000800
+	ofnFileMustExist    = 0x00001000
+	ofnExplorer         = 0x00080000
+	fnerrBufferTooSmall = 0x3003
+	openFileBufLen      = 1 << 16 // ký tự UTF-16, đủ cho vài trăm file
+
 	iccStandardClasses = 0x4000
 	iccWin95Classes    = 0x00FF
 	coinitApartment    = 0x2
@@ -151,11 +172,14 @@ const (
 	idOutBtn
 	idChkTools
 	idChkThinking
+	idChkTitle
 	idChkOpen
+	idChkIncremental
 	idRun
 	idOpenOut
 	idOpenLog
 	idLog
+	idSrcFileBtn
 )
 
 type wndClassEx struct {
@@ -171,6 +195,33 @@ type wndClassEx struct {
 	lpszMenuName  *uint16
 	lpszClassName *uint16
 	hIconSm       uintptr
+}
+
+// openFileName là OPENFILENAMEW.
+type openFileName struct {
+	lStructSize       uint32
+	hwndOwner         uintptr
+	hInstance         uintptr
+	lpstrFilter       *uint16
+	lpstrCustomFilter *uint16
+	nMaxCustFilter    uint32
+	nFilterIndex      uint32
+	lpstrFile         *uint16
+	nMaxFile          uint32
+	lpstrFileTitle    *uint16
+	nMaxFileTitle     uint32
+	lpstrInitialDir   *uint16
+	lpstrTitle        *uint16
+	flags             uint32
+	nFileOffset       uint16
+	nFileExtension    uint16
+	lpstrDefExt       *uint16
+	lCustData         uintptr
+	lpfnHook          uintptr
+	lpTemplateName    *uint16
+	pvReserved        uintptr
+	dwReserved        uint32
+	flagsEx           uint32
 }
 
 type point struct{ x, y int32 }
@@ -337,13 +388,57 @@ func postEvent(e event) {
 var (
 	hInst, hwndMain, hFont        uintptr
 	hSrc, hOut, hTools, hThinking uintptr
-	hOpen, hRun, hOpenOut, hLog   uintptr
+	hTitle, hIncr, hOpen, hRun    uintptr
+	hOpenOut, hLog                uintptr
 	dpi                           = 96
 	events                        = make(chan event, 512)
 	running                       bool
 	lastOutDir                    string
 	runLabel                      string // chữ gốc của nút Chuyển đổi, khôi phục khi xong
+	settings                      Settings
 )
+
+// ---------- nhớ nguồn và thư mục đầu ra ----------
+
+// fillHistory nạp lịch sử vào danh sách sổ xuống của combobox, giữ chữ đang có trong ô.
+func fillHistory(h uintptr, list []string) {
+	cur := getText(h)
+	sendMsg(h, cbResetContent, 0, 0)
+	for _, d := range list {
+		sendMsg(h, cbAddString, 0, ptr(wstr(d)))
+	}
+	setText(h, cur)
+}
+
+// remember ghi v làm giá trị cuối cùng của ô h (hSrc hoặc hOut); addHistory thì đưa vào lịch sử.
+func remember(h uintptr, v string, addHistory bool) {
+	if v == "" {
+		return
+	}
+	last, recent := &settings.LastOut, &settings.RecentOut
+	if h == hSrc {
+		last, recent = &settings.LastSrc, &settings.RecentSrc
+	}
+	*last = v
+	if addHistory {
+		*recent = addRecent(*recent, v)
+		fillHistory(h, *recent)
+	}
+	saveSettings(settingsPath(), settings)
+}
+
+// historyCombo tạo ô nhập có nút sổ xuống chứa lịch sử, hiện sẵn giá trị cuối (hoặc def).
+func historyCombo(x, y, w, id int, recent []string, last, def string) uintptr {
+	h := control("COMBOBOX", "", wsTabStop|wsVScroll|cbsDropDown|cbsAutoHScroll, 0, x, y, w, 220, id)
+	sendMsg(h, cbSetItemHeight, ^uintptr(0), scale(20)) // ô chọn cao ngang các nút bên cạnh
+	sendMsg(h, cbSetDroppedWidth, scale(528), 0)
+	fillHistory(h, recent)
+	if last == "" {
+		last = def
+	}
+	setText(h, last)
+	return h
+}
 
 func scale(v int) uintptr { return uintptr(v * dpi / 96) }
 
@@ -397,6 +492,77 @@ func pickFolder(title, initial string) (string, bool) {
 	return syscall.UTF16ToString(buf), true
 }
 
+// sourceDirHint trả về thư mục để mở sẵn trong hộp thoại chọn, suy từ ô nguồn
+// (thư mục, hoặc thư mục chứa file đầu tiên trong danh sách).
+func sourceDirHint() string {
+	inputs := SplitInputs(getText(hSrc))
+	if len(inputs) == 0 {
+		return DefaultSourceDir()
+	}
+	p := inputs[0]
+	if st, err := os.Stat(p); err == nil && st.IsDir() {
+		return p
+	}
+	if st, err := os.Stat(filepath.Dir(p)); err == nil && st.IsDir() {
+		return filepath.Dir(p)
+	}
+	return DefaultSourceDir()
+}
+
+// parseMultiSelect đọc kết quả OFN_ALLOWMULTISELECT|OFN_EXPLORER: một file thì là
+// đường dẫn đầy đủ; nhiều file thì "thư mục\0tên1\0tên2\0\0".
+func parseMultiSelect(buf []uint16) []string {
+	var parts []string
+	for start, i := 0, 0; i < len(buf); i++ {
+		if buf[i] != 0 {
+			continue
+		}
+		if i == start {
+			break // hai số 0 liền nhau: hết danh sách
+		}
+		parts = append(parts, syscall.UTF16ToString(buf[start:i]))
+		start = i + 1
+	}
+	if len(parts) <= 1 {
+		return parts
+	}
+	files := make([]string, 0, len(parts)-1)
+	for _, name := range parts[1:] {
+		files = append(files, filepath.Join(parts[0], name))
+	}
+	return files
+}
+
+// pickFiles mở hộp thoại chọn một hoặc nhiều file .jsonl.
+func pickFiles(initialDir string) ([]string, bool) {
+	filter := utf16.Encode([]rune("File chat Claude Code (*.jsonl)\x00*.jsonl\x00Tất cả file (*.*)\x00*.*\x00\x00"))
+	buf := make([]uint16, openFileBufLen)
+	ofn := openFileName{
+		hwndOwner:       hwndMain,
+		lpstrFilter:     &filter[0],
+		nFilterIndex:    1,
+		lpstrFile:       &buf[0],
+		nMaxFile:        uint32(len(buf)),
+		lpstrInitialDir: wstr(initialDir),
+		lpstrTitle:      wstr("Chọn một hoặc nhiều file chat (giữ Ctrl hoặc Shift để chọn nhiều)"),
+		flags:           ofnExplorer | ofnAllowMultiSelect | ofnFileMustExist | ofnPathMustExist | ofnHideReadOnly | ofnNoChangeDir,
+	}
+	ofn.lStructSize = uint32(unsafe.Sizeof(ofn))
+	ok := call(pGetOpenFileNameW, uintptr(unsafe.Pointer(&ofn))) != 0
+	runtime.KeepAlive(filter)
+	if !ok {
+		if code := call(pCommDlgExtendedError); code != 0 {
+			logDebug("GetOpenFileNameW failed: 0x%x", code)
+			if code == fnerrBufferTooSmall {
+				msgBox(hwndMain, "Chọn quá nhiều file cùng lúc. Hãy chọn ít file hơn, hoặc chọn cả thư mục.", mbIconWarn)
+			}
+		}
+		return nil, false
+	}
+	files := parseMultiSelect(buf)
+	return files, len(files) > 0
+}
+
 func openFolder(path string) {
 	call(pShellExecuteW, hwndMain, ptr(wstr("open")), ptr(wstr(path)), 0, 0, swShowNormal)
 }
@@ -407,33 +573,41 @@ func startConvert() {
 	if running {
 		return
 	}
-	src, out := getText(hSrc), getText(hOut)
-	if src == "" || out == "" {
-		msgBox(hwndMain, "Vui lòng nhập đủ thư mục nguồn và thư mục đầu ra.", mbIconWarn)
+	inputs, out := SplitInputs(getText(hSrc)), getText(hOut)
+	if len(inputs) == 0 || out == "" {
+		msgBox(hwndMain, "Vui lòng nhập đủ nguồn (thư mục hoặc file chat) và thư mục đầu ra.", mbIconWarn)
 		return
 	}
-	if _, err := os.Stat(src); err != nil {
-		msgBox(hwndMain, "Không tìm thấy thư mục nguồn:\n"+src, mbIconError)
-		return
+	for _, in := range inputs {
+		if _, err := os.Stat(in); err != nil {
+			msgBox(hwndMain, "Không tìm thấy nguồn:\n"+in, mbIconError)
+			return
+		}
 	}
-	opt := Options{Tools: isChecked(hTools), Thinking: isChecked(hThinking)}
+	opt := Options{Tools: isChecked(hTools), Thinking: isChecked(hThinking), TitleName: isChecked(hTitle), Incremental: isChecked(hIncr)}
 
 	running = true
 	lastOutDir = out
+	remember(hSrc, JoinInputs(inputs), true)
+	remember(hOut, out, true)
 	call(pEnableWindow, hRun, 0)
 	runLabel = getText(hRun)
 	setText(hRun, " Đang chuyển…")
 	setText(hLog, "")
-	logInfo("Nguồn: %s", src)
+	if len(inputs) == 1 {
+		logInfo("Nguồn: %s", inputs[0])
+	} else {
+		logInfo("Nguồn: %d mục đã chọn", len(inputs))
+	}
 	logInfo("Đầu ra: %s", out)
 
 	go func() {
-		res, err := ConvertAll(src, out, opt)
+		res, err := ConvertAll(inputs, out, opt)
 		if err != nil {
 			logError("Lỗi: %v", err)
 		} else {
 			logInfo("")
-			logInfo("Xong: %d file Markdown, bỏ qua %d file trống, %d lỗi.", res.OK, res.Skipped, res.Failed)
+			logInfo("Xong: %d file Markdown mới/cập nhật, %d không đổi, bỏ qua %d file trống, %d lỗi.", res.OK, res.Unchanged, res.Skipped, res.Failed)
 		}
 		postEvent(event{done: true, res: res, err: err})
 	}()
@@ -472,12 +646,19 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		if (wParam>>16)&0xFFFF == bnClicked {
 			switch wParam & 0xFFFF {
 			case idSrcBtn:
-				if p, ok := pickFolder("Chọn thư mục dữ liệu chat (thường là .claude\\projects):", getText(hSrc)); ok {
+				if p, ok := pickFolder("Chọn thư mục dữ liệu chat (thường là .claude\\projects):", sourceDirHint()); ok {
 					setText(hSrc, p)
+					remember(hSrc, p, true)
+				}
+			case idSrcFileBtn:
+				if files, ok := pickFiles(sourceDirHint()); ok {
+					setText(hSrc, JoinInputs(files))
+					remember(hSrc, JoinInputs(files), true)
 				}
 			case idOutBtn:
-				if p, ok := pickFolder("Chọn thư mục lưu file Markdown:", getText(hOut)); ok {
+				if p, ok := pickFolder("Chọn thư mục lưu tệp Markdown:", getText(hOut)); ok {
 					setText(hOut, p)
+					remember(hOut, p, true)
 				}
 			case idRun:
 				startConvert()
@@ -501,6 +682,13 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		drainEvents()
 		return 0
 	case wmDestroy:
+		// Nhớ cả đường dẫn gõ tay hoặc chọn từ lịch sử mà chưa chuyển đổi.
+		if src := getText(hSrc); src != "" && src != settings.LastSrc {
+			remember(hSrc, src, false)
+		}
+		if out := getText(hOut); out != "" && out != settings.LastOut {
+			remember(hOut, out, false)
+		}
 		call(pPostQuitMessage, 0)
 		return 0
 	}
@@ -542,7 +730,7 @@ func main() {
 	call(pRegisterClassExW, uintptr(unsafe.Pointer(&wc)))
 
 	// Kích thước vùng nội dung (px ở 96 DPI)
-	const clientW, clientH = 560, 480
+	const clientW, clientH = 560, 528
 	style := uintptr(wsOverlapped | wsCaption | wsSysMenu | wsMinimizeBox)
 	r := rect{0, 0, int32(scale(clientW)), int32(scale(clientH))}
 	call(pAdjustWindowRectEx, uintptr(unsafe.Pointer(&r)), style, 0, wsExControlParent)
@@ -555,29 +743,36 @@ func main() {
 		uintptr(x), uintptr(y), uintptr(winW), uintptr(winH), 0, 0, hInst, 0)
 
 	// --- các điều khiển ---
-	control("STATIC", "Thư mục dữ liệu chat của Claude Code:", 0, 0, 16, 16, 528, 18, 0)
-	hSrc = control("EDIT", DefaultSourceDir(), wsTabStop|esAutoHScroll, wsExClientEdge, 16, 38, 424, 26, idSrcEdit)
-	setButtonIcon(control("BUTTON", "Chọn…", wsTabStop|bsPushButton, 0, 448, 37, 96, 28, idSrcBtn), "chat")
+	// Ô nguồn và ô thư mục đầu ra là combobox: gõ tay được, nút sổ xuống hiện các mục dùng gần đây.
+	settings = loadSettings(settingsPath())
+	control("STATIC", "Dữ liệu chat của Claude Code (cả thư mục, hoặc một/nhiều tệp):", 0, 0, 16, 16, 528, 18, 0)
+	hSrc = historyCombo(16, 38, 316, idSrcEdit, settings.RecentSrc, settings.LastSrc, DefaultSourceDir())
+	setButtonIcon(control("BUTTON", "Thư mục…", wsTabStop|bsPushButton, 0, 340, 37, 100, 28, idSrcBtn), "chat")
+	setButtonIcon(control("BUTTON", "Chọn tệp…", wsTabStop|bsPushButton, 0, 444, 37, 100, 28, idSrcFileBtn), "export-chat")
 
-	control("STATIC", "Thư mục lưu file Markdown:", 0, 0, 16, 76, 528, 18, 0)
-	hOut = control("EDIT", DefaultOutputDir(), wsTabStop|esAutoHScroll, wsExClientEdge, 16, 98, 424, 26, idOutEdit)
+	control("STATIC", "Thư mục lưu tệp Markdown:", 0, 0, 16, 76, 528, 18, 0)
+	hOut = historyCombo(16, 98, 424, idOutEdit, settings.RecentOut, settings.LastOut, DefaultOutputDir())
 	setButtonIcon(control("BUTTON", "Chọn…", wsTabStop|bsPushButton, 0, 448, 97, 96, 28, idOutBtn), "markdown-file")
 
-	control("BUTTON", "Tùy chọn", bsGroupBox, 0, 16, 138, 528, 100, 0)
+	control("BUTTON", "Tùy chọn", bsGroupBox, 0, 16, 138, 528, 148, 0)
 	hTools = control("BUTTON", "Kèm các lệnh Claude đã chạy và kết quả (thu gọn)", wsTabStop|bsAutoCheckBox, 0, 32, 160, 500, 22, idChkTools)
 	hThinking = control("BUTTON", "Kèm phần suy luận (thinking) của Claude", wsTabStop|bsAutoCheckBox, 0, 32, 184, 500, 22, idChkThinking)
-	hOpen = control("BUTTON", "Mở thư mục đầu ra khi xong", wsTabStop|bsAutoCheckBox, 0, 32, 208, 500, 22, idChkOpen)
+	hTitle = control("BUTTON", "Đặt tên tệp theo tên phiên chat (thay vì mã session)", wsTabStop|bsAutoCheckBox, 0, 32, 208, 500, 22, idChkTitle)
+	sendMsg(hTitle, bmSetCheck, bstChecked, 0)
+	hIncr = control("BUTTON", "Chỉ chuyển chat mới hoặc đã thay đổi (bỏ qua chat đã xuất)", wsTabStop|bsAutoCheckBox, 0, 32, 232, 500, 22, idChkIncremental)
+	sendMsg(hIncr, bmSetCheck, bstChecked, 0)
+	hOpen = control("BUTTON", "Mở thư mục đầu ra khi xong", wsTabStop|bsAutoCheckBox, 0, 32, 256, 500, 22, idChkOpen)
 	sendMsg(hOpen, bmSetCheck, bstChecked, 0)
 
-	hRun = control("BUTTON", "Chuyển đổi", wsTabStop|bsDefPushButton, 0, 16, 252, 150, 34, idRun)
-	hOpenOut = control("BUTTON", "Mở thư mục đầu ra", wsTabStop|bsPushButton, 0, 176, 252, 150, 34, idOpenOut)
-	hOpenLog := control("BUTTON", "Mở thư mục log", wsTabStop|bsPushButton, 0, 336, 252, 150, 34, idOpenLog)
+	hRun = control("BUTTON", "Chuyển đổi", wsTabStop|bsDefPushButton, 0, 16, 300, 150, 34, idRun)
+	hOpenOut = control("BUTTON", "Mở thư mục đầu ra", wsTabStop|bsPushButton, 0, 176, 300, 150, 34, idOpenOut)
+	hOpenLog := control("BUTTON", "Mở thư mục log", wsTabStop|bsPushButton, 0, 336, 300, 150, 34, idOpenLog)
 	setButtonIcon(hRun, "export-all")
 	setButtonIcon(hOpenOut, "folder-output")
 	setButtonIcon(hOpenLog, "history")
 
-	control("STATIC", "Nhật ký:", 0, 0, 16, 300, 528, 18, 0)
-	hLog = control("EDIT", "", wsTabStop|wsVScroll|esMultiline|esAutoVScroll|esReadOnly, wsExClientEdge, 16, 320, 528, 144, idLog)
+	control("STATIC", "Nhật ký:", 0, 0, 16, 348, 528, 18, 0)
+	hLog = control("EDIT", "", wsTabStop|wsVScroll|esMultiline|esAutoVScroll|esReadOnly, wsExClientEdge, 16, 368, 528, 144, idLog)
 	sendMsg(hLog, emLimitText, 0, 0) // bỏ giới hạn độ dài nhật ký
 	setLogSink(func(s string) { postEvent(event{text: s}) })
 	setText(hLog, "Bấm \"Chuyển đổi\" để bắt đầu. Dữ liệu gốc chỉ được đọc, không bị sửa hay xóa.")

@@ -70,6 +70,9 @@ $AppName - phiên bản $Version
 - File Markdown xuất ra chứa nguyên nội dung chat: xem lại trước khi chia sẻ.
 - Nhật ký ở thư mục 'logs' cạnh file exe (hoặc %LOCALAPPDATA%\$AppName\logs nếu không có quyền ghi),
   tự xóa sau 7 ngày. Nút "Mở thư mục log" trong ứng dụng mở thẳng thư mục này.
+- Cài đặt (nguồn và thư mục lưu tệp Markdown dùng lần cuối, cùng lịch sử gần đây) ở file settings.json
+  cạnh file exe (hoặc %APPDATA%\$AppName nếu không có quyền ghi). Khi cập nhật bản mới, chỉ
+  chép đè file exe để giữ lại cài đặt và nhật ký.
 "@
 
 # Chép exe + hướng dẫn vào một thư mục (ghi đè file cũ, không xóa thư mục)

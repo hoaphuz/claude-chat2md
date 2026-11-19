@@ -116,19 +116,13 @@ func cleanOldLogs(dir string, days int) {
 // findLogDir: dev\logs của dự án (khi `go run`) → logs cạnh file exe → thư mục cache người dùng
 // (%LOCALAPPDATA%\claude-chat2md\logs trên Windows).
 func findLogDir() string {
-	exeDir := ""
-	if p, err := os.Executable(); err == nil {
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			p = r
-		}
-		exeDir = filepath.Dir(p)
-	}
+	exe := exeDir()
 	var candidates []string
-	if root := devRoot(exeDir); root != "" {
+	if root := devRoot(exe); root != "" {
 		candidates = append(candidates, filepath.Join(root, "dev", "logs"))
 	}
-	if exeDir != "" {
-		candidates = append(candidates, filepath.Join(exeDir, "logs"))
+	if exe != "" {
+		candidates = append(candidates, filepath.Join(exe, "logs"))
 	}
 	if base, err := os.UserCacheDir(); err == nil {
 		candidates = append(candidates, filepath.Join(base, appName, "logs"))
@@ -139,6 +133,18 @@ func findLogDir() string {
 		}
 	}
 	return ""
+}
+
+// exeDir trả về thư mục chứa file exe đang chạy ("" nếu không xác định được).
+func exeDir() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	return filepath.Dir(p)
 }
 
 // devRoot: exe do `go run` tạo nằm trong thư mục go-build tạm/cache; khi đó tìm thư mục

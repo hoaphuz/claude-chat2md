@@ -12,8 +12,10 @@ Claude Code stores every conversation as a `.jsonl` transcript under `~/.claude/
 
 - **Single portable `.exe` for Windows** — native Win32 GUI, ~2.5 MB, nothing to install (no Python, Node, or .NET).
 - **Read-only** — your transcripts are never modified or deleted.
-- **Whole history or one chat** — pick the `projects` folder, a single project folder, or one `.jsonl` file. The folder structure is mirrored in the output.
+- **Whole history or just a few chats** — pick the `projects` folder, a single project folder, or one or more `.jsonl` files. The folder structure is mirrored in the output.
 - **Optional details** — include tool calls with their results, and Claude's thinking, each folded inside `<details>`.
+- **Incremental export** — only new or changed chats are converted; unchanged ones are skipped (tracked in `.claude-chat2md-state.json` in the output folder).
+- **Readable file names** — name each `.md` after the chat's title (your custom name or the one Claude Code generates) instead of the session id.
 - **Clean output** — injected system tags are stripped, subagent (sidechain) chatter is dropped, and consecutive messages from the same side are grouped.
 - **Pure Go, standard library only** — no third-party dependencies, easy to audit.
 - **CLI for macOS/Linux** with the same converter.
@@ -30,9 +32,9 @@ Requirements: Windows 10/11, 64-bit.
 
 ## Usage (Windows GUI)
 
-1. **Source** (top field) — defaults to `%USERPROFILE%\.claude\projects` (or `%CLAUDE_CONFIG_DIR%\projects`). You can also choose one project folder inside it, or type the path of a single `.jsonl` file.
-2. **Output** — defaults to `Documents\claude-export`.
-3. Options (checkboxes, in order): include tool calls and results · include thinking · open the output folder when done.
+1. **Source** (top field) — defaults to `%USERPROFILE%\.claude\projects` (or `%CLAUDE_CONFIG_DIR%\projects`). Use **Thư mục…** (Folder) to choose one project folder inside it, or **Chọn tệp…** (Choose files) to pick one or more `.jsonl` files (Ctrl/Shift-click); several paths can also be typed separated by `;`. The last used source is remembered, and the drop-down lists the 10 most recent ones. Picked files are always converted, and files inside `projects` keep their project subfolder in the output.
+2. **Output** — defaults to `Documents\claude-export`. The last used folder is remembered across restarts, and the drop-down lists the 10 most recent ones (stored in `settings.json` next to the exe, or in `%APPDATA%\claude-chat2md` if that folder isn't writable).
+3. Options (checkboxes, in order): include tool calls and results · include thinking · name files after the chat title (on by default; invalid characters are replaced, duplicates get ` (2)`, ` (3)`…) · only convert new or changed chats (on by default) · open the output folder when done.
 4. Click the **Chuyển đổi** (Convert) button. The log box shows each exported file and a summary.
 
 Each chat becomes one `.md` file with a title, session id, project path, start time, and timestamped turns. Converting again overwrites existing `.md` files with the same name.
@@ -42,11 +44,15 @@ Each chat becomes one `.md` file with a title, session id, project path, start t
 ## Usage (CLI, macOS/Linux)
 
 ```
-claude-chat2md [-tools] [-thinking] [-version] [file.jsonl | dir] [out-dir]
+claude-chat2md [-tools] [-thinking] [-title] [-update] [-version] [file.jsonl | dir] [out-dir]
+claude-chat2md [flags] -o out-dir file.jsonl|dir ...
 ```
 
 - `-tools` — include tool calls and results
 - `-thinking` — include thinking blocks
+- `-title` — name files after the chat title instead of the session id
+- `-update` — only convert chats that are new or changed since the last export
+- `-o out-dir` — output folder; every remaining argument is then a source, so several files can be converted at once
 - No source → `~/.claude/projects`; no output dir → `./claude-export`
 
 Example: `claude-chat2md -tools ~/.claude/projects ~/Documents/claude-export`
@@ -79,7 +85,7 @@ If you prefer a CLI, HTML output, or a web viewer, check out [claude-code-log](h
 
 ## Contributing
 
-Issues and pull requests are welcome. Please keep the project dependency-free (Go standard library only) and run `go vet ./...` and `go test ./...` before submitting. When reporting a conversion bug, attach the `debug-<date>.log` file — it contains no chat content.
+Issues and pull requests are welcome. A short developer guide (in Vietnamese) is in [docs-dev/](docs-dev/README.md). Please keep the project dependency-free (Go standard library only) and run `go vet ./...` and `go test ./...` before submitting. When reporting a conversion bug, attach the `debug-<date>.log` file — it contains no chat content.
 
 ## License
 
